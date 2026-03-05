@@ -1,0 +1,9 @@
+## Interface: 120001
+## Title: Runaway Raid Attendance
+## Notes: Gera CSV de attendance dos players no grupo de raid para raid.runaway.com.br
+## Author: Runaway Guild
+## Version: 2.0.0
+## SavedVariables: RunawayRaidAttendanceDB
+## IconTexture: Interface\Icons\INV_Scroll_03
+
+RunawayRaidAttendance.lua
