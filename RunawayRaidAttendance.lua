@@ -253,22 +253,133 @@ local function GetOnlineGuildMembers()
 end
 
 local inviteTimerActive = false
+local INVITE_DELAY = 0.3  -- delay entre cada convite (segundos) para evitar throttle
 
-local function DoInviteGuildMembers()
+-- Frame dedicado para escutar GUILD_ROSTER_UPDATE
+local GuildUpdateFrame = CreateFrame("Frame")
+local pendingInviteCallback = nil
+
+GuildUpdateFrame:SetScript("OnEvent", function(self, event)
+    if event == "GUILD_ROSTER_UPDATE" and pendingInviteCallback then
+        self:UnregisterEvent("GUILD_ROSTER_UPDATE")
+        local cb = pendingInviteCallback
+        pendingInviteCallback = nil
+        cb()
+    end
+end)
+
+local function DoInviteGuildMembers(statusCallback)
+    -- Converter para raid se estiver em party (para poder convidar mais de 4)
+    if IsInGroup() and not IsInRaid() then
+        ConvertToRaid()
+    end
+
     local members = GetOnlineGuildMembers()
     local playerName = UnitName("player")
-    local invited = 0
 
+    -- Debug: mostrar quantos membros online foram encontrados
+    print("|cffcc2020[Runaway DEBUG]|r Membros online na guild: " .. #members)
+
+    -- Filtrar quem sera convidado
+    local toInvite = {}
     for _, m in ipairs(members) do
-        -- Rank 0-6 = inclui Trial (rank 6)
         if m.rankIndex <= 6 and StripRealm(m.name) ~= playerName then
-            InviteUnit(m.name)
-            invited = invited + 1
+            table.insert(toInvite, m.name)
         end
     end
 
-    inviteTimerActive = false
-    return invited
+    print("|cffcc2020[Runaway DEBUG]|r Elegiveis para convite (rank 0-6): " .. #toInvite)
+
+    if #toInvite == 0 then
+        print("|cffcc2020[Runaway]|r Nenhum membro elegivel online para convidar.")
+        inviteTimerActive = false
+        if statusCallback then
+            statusCallback("|cfff87171Nenhum membro elegivel online.|r")
+        end
+        return
+    end
+
+    -- Usar a API moderna do Retail (C_PartyInfo.InviteUnit) com fallback
+    local inviteFunc
+    if C_PartyInfo and C_PartyInfo.InviteUnit then
+        inviteFunc = C_PartyInfo.InviteUnit
+        print("|cffcc2020[Runaway DEBUG]|r Usando C_PartyInfo.InviteUnit")
+    else
+        inviteFunc = InviteUnit
+        print("|cffcc2020[Runaway DEBUG]|r Usando InviteUnit (fallback)")
+    end
+
+    local invited = 0
+    local total = #toInvite
+
+    -- Primeiro convite imediato para criar o grupo
+    print("|cffcc2020[Runaway DEBUG]|r Convidando: " .. toInvite[1])
+    inviteFunc(toInvite[1])
+    invited = 1
+
+    -- Restante com delay escalonado
+    if total > 1 then
+        -- Pequeno delay apos o primeiro para o grupo ser criado
+        C_Timer.After(0.5, function()
+            -- Converter para raid antes de convidar o resto
+            if IsInGroup() and not IsInRaid() and total > 4 then
+                ConvertToRaid()
+            end
+
+            for i = 2, total do
+                C_Timer.After((i - 2) * INVITE_DELAY, function()
+                    -- Converter para raid quando atingir limite de party
+                    if GetNumGroupMembers() >= 4 and not IsInRaid() then
+                        ConvertToRaid()
+                    end
+
+                    print("|cffcc2020[Runaway DEBUG]|r Convidando: " .. toInvite[i])
+                    inviteFunc(toInvite[i])
+                    invited = invited + 1
+
+                    if invited >= total then
+                        inviteTimerActive = false
+                        print("|cffcc2020[Runaway]|r " .. invited .. " convites enviados (Ranks 0-6, incluindo Trial).")
+                        if statusCallback then
+                            statusCallback(string.format("|cff4ade80%d convites enviados|r (Ranks 0-6, incluindo Trial).", invited))
+                        end
+                    end
+                end)
+            end
+        end)
+    else
+        inviteTimerActive = false
+        print("|cffcc2020[Runaway]|r " .. invited .. " convite enviado (Ranks 0-6, incluindo Trial).")
+        if statusCallback then
+            statusCallback(string.format("|cff4ade80%d convite enviado|r (Ranks 0-6, incluindo Trial).", invited))
+        end
+    end
+end
+
+local function RequestGuildRosterThenInvite(statusCallback)
+    -- Registrar para escutar a resposta do servidor
+    pendingInviteCallback = function()
+        DoInviteGuildMembers(statusCallback)
+    end
+    GuildUpdateFrame:RegisterEvent("GUILD_ROSTER_UPDATE")
+
+    -- Pedir atualizacao ao servidor
+    if C_GuildInfo and C_GuildInfo.GuildRoster then
+        C_GuildInfo.GuildRoster()
+    elseif GuildRoster then
+        GuildRoster()
+    end
+
+    -- Fallback: se o evento nao chegar em 3 segundos, convida com dados atuais
+    C_Timer.After(3, function()
+        if pendingInviteCallback then
+            print("|cffcc2020[Runaway DEBUG]|r GUILD_ROSTER_UPDATE nao chegou, usando dados em cache.")
+            GuildUpdateFrame:UnregisterEvent("GUILD_ROSTER_UPDATE")
+            local cb = pendingInviteCallback
+            pendingInviteCallback = nil
+            cb()
+        end
+    end)
 end
 
 local function InviteGuildByRank(statusCallback)
@@ -284,6 +395,13 @@ local function InviteGuildByRank(statusCallback)
 
     inviteTimerActive = true
 
+    -- Forcar atualizacao do roster da guild com antecedencia
+    if C_GuildInfo and C_GuildInfo.GuildRoster then
+        C_GuildInfo.GuildRoster()
+    elseif GuildRoster then
+        GuildRoster()
+    end
+
     -- Aviso no chat da guild
     SendChatMessage("Invites em 10s! Vem pra raid!", "GUILD")
     print("|cffcc2020[Runaway]|r Aviso enviado na guild. Invites em 10 segundos...")
@@ -292,13 +410,9 @@ local function InviteGuildByRank(statusCallback)
         statusCallback("|cfffacc15Invites em 10s...|r Aviso enviado no chat da guild.")
     end
 
-    -- Timer de 10 segundos, depois faz os invites
+    -- Timer de 10 segundos, depois pede roster atualizado e faz os invites
     C_Timer.After(10, function()
-        local count = DoInviteGuildMembers()
-        print("|cffcc2020[Runaway]|r " .. count .. " convites enviados (Ranks 0-6, incluindo Trial).")
-        if statusCallback then
-            statusCallback(string.format("|cff4ade80%d convites enviados|r (Ranks 0-6, incluindo Trial).", count))
-        end
+        RequestGuildRosterThenInvite(statusCallback)
     end)
 end
 
@@ -614,12 +728,20 @@ MinimapBtn:RegisterForDrag("LeftButton")
 
 local MinimapIcon = MinimapBtn:CreateTexture(nil, "BACKGROUND")
 MinimapIcon:SetSize(20, 20)
-MinimapIcon:SetPoint("CENTER")
+MinimapIcon:SetPoint("CENTER", MinimapBtn, "CENTER", 0, 0)
 MinimapIcon:SetTexture("Interface\\Icons\\Ability_Mount_WhiteDireWolf")
+MinimapIcon:SetTexCoord(0.05, 0.95, 0.05, 0.95)  -- corta a borda padrao do icone
+
+-- Mascara circular para o icone ficar redondo
+local MinimapMask = MinimapBtn:CreateMaskTexture()
+MinimapMask:SetSize(20, 20)
+MinimapMask:SetPoint("CENTER", MinimapIcon, "CENTER", 0, 0)
+MinimapMask:SetTexture("Interface\\CHARACTERFRAME\\TempPortraitAlphaMask")
+MinimapIcon:AddMaskTexture(MinimapMask)
 
 local MinimapBorder = MinimapBtn:CreateTexture(nil, "OVERLAY")
 MinimapBorder:SetSize(54, 54)
-MinimapBorder:SetPoint("CENTER")
+MinimapBorder:SetPoint("CENTER", MinimapBtn, "CENTER", 10, -10)
 MinimapBorder:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
 
 MinimapBtn:SetScript("OnClick", function(self, button)
@@ -701,6 +823,14 @@ SlashCmdList["RUNAWAY"] = function(msg)
             print(string.format("  |cffa88080#%d|r %s - %d presentes (%s)",
                 i, e.date, e.present, e.format == "largo" and "Largo" or "Alto"))
         end
+    elseif msg == "autoaccept" or msg == "aa" then
+        autoAcceptEnabled = not autoAcceptEnabled
+        RunawayRaidAttendanceDB.settings.autoAccept = autoAcceptEnabled
+        if autoAcceptEnabled then
+            print("|cffcc2020[Runaway]|r Auto-accept |cff4ade80LIGADO|r. Convites de guildmates serao aceitos automaticamente.")
+        else
+            print("|cffcc2020[Runaway]|r Auto-accept |cfff87171DESLIGADO|r.")
+        end
     elseif msg == "reset" then
         RunawayRaidAttendanceDB.history = {}
         print("|cffcc2020[Runaway]|r Historico limpo.")
@@ -712,6 +842,7 @@ SlashCmdList["RUNAWAY"] = function(msg)
         print("|cffcc2020/rra assist|r - Dar assist (ranks 2-3)")
         print("|cffcc2020/rra alto|r / |cffcc2020largo|r - Trocar formato CSV")
         print("|cffcc2020/rra history|r - Ver historico")
+        print("|cffcc2020/rra autoaccept|r - Ligar/desligar auto-accept de guild")
         print("|cffcc2020/rra reset|r - Limpar historico")
     else
         if MainFrame:IsShown() then MainFrame:Hide() else MainFrame:Show() end
@@ -719,11 +850,93 @@ SlashCmdList["RUNAWAY"] = function(msg)
 end
 
 -- ============================================================================
+-- AUTO-ACCEPT: aceita invite de membros da guild automaticamente
+-- Escuta whispers com "inv" e aceita convites de grupo de guildmates
+-- ============================================================================
+
+local autoAcceptEnabled = true
+
+-- Construir set de membros da guild para lookup rapido
+local function GetGuildMemberSet()
+    local set = {}
+    local numTotal = GetNumGuildMembers()
+    for i = 1, numTotal do
+        local name = GetGuildRosterInfo(i)
+        if name then
+            set[name] = true
+            set[StripRealm(name)] = true
+        end
+    end
+    return set
+end
+
+local function IsGuildMember(name)
+    if not IsInGuild() then return false end
+    local guildSet = GetGuildMemberSet()
+    return guildSet[name] or guildSet[StripRealm(name)] or false
+end
+
+-- Frame para escutar whispers e convites de grupo
+local AutoAcceptFrame = CreateFrame("Frame")
+AutoAcceptFrame:RegisterEvent("CHAT_MSG_WHISPER")
+AutoAcceptFrame:RegisterEvent("PARTY_INVITE_REQUEST")
+
+AutoAcceptFrame:SetScript("OnEvent", function(self, event, ...)
+    if not autoAcceptEnabled then return end
+    if not IsInGuild() then return end
+
+    if event == "CHAT_MSG_WHISPER" then
+        local msg, sender = ...
+        local msgLower = string.lower(strtrim(msg))
+
+        -- Aceitar se a mensagem for "inv", "invite", "convite", "raid"
+        if msgLower == "inv" or msgLower == "invite" or msgLower == "convite" or msgLower == "raid" then
+            if IsGuildMember(sender) then
+                local displayName = StripRealm(sender)
+                print("|cffcc2020[Runaway]|r " .. displayName .. " pediu invite via whisper. Convidando...")
+
+                local inviteFunc
+                if C_PartyInfo and C_PartyInfo.InviteUnit then
+                    inviteFunc = C_PartyInfo.InviteUnit
+                else
+                    inviteFunc = InviteUnit
+                end
+
+                -- Se nao esta em grupo, convida direto (cria grupo)
+                -- Se esta em grupo e pode convidar, convida
+                inviteFunc(sender)
+                SendChatMessage("Invite enviado!", "WHISPER", nil, sender)
+            end
+        end
+
+    elseif event == "PARTY_INVITE_REQUEST" then
+        local sender = ...
+        if IsGuildMember(sender) then
+            local displayName = StripRealm(sender)
+            print("|cffcc2020[Runaway]|r Convite de " .. displayName .. " (guild) aceito automaticamente.")
+
+            -- Aceitar o convite automaticamente
+            if C_PartyInfo and C_PartyInfo.ConfirmInviteUnit then
+                C_PartyInfo.ConfirmInviteUnit(sender)
+            end
+            AcceptGroup()
+
+            -- Esconder o popup de convite depois de um tick
+            C_Timer.After(0.1, function()
+                StaticPopup_Hide("PARTY_INVITE")
+                StaticPopup_Hide("PARTY_INVITE_XREALM")
+            end)
+        end
+    end
+end)
+
+-- ============================================================================
 -- INIT
 -- ============================================================================
 
 local EventFrame = CreateFrame("Frame")
 EventFrame:RegisterEvent("ADDON_LOADED")
+EventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 EventFrame:SetScript("OnEvent", function(self, event, arg1)
     if event == "ADDON_LOADED" and arg1 == addonName then
         local db = RunawayRaidAttendanceDB
@@ -731,11 +944,24 @@ EventFrame:SetScript("OnEvent", function(self, event, arg1)
         db.settings = db.settings or {}
         db.settings.csvFormat = db.settings.csvFormat or "alto"
         db.settings.minimapAngle = db.settings.minimapAngle or 220
+        if db.settings.autoAccept == nil then db.settings.autoAccept = true end
+        autoAcceptEnabled = db.settings.autoAccept
 
         UpdateFormatLabel()
         UpdateMinimapPos()
 
         print("|cffcc2020[RUNAWAY]|r Raid Attendance v2.0 carregado! |cffa88080/rra help|r")
         self:UnregisterEvent("ADDON_LOADED")
+
+    elseif event == "PLAYER_ENTERING_WORLD" then
+        -- Forcar atualizacao do roster da guild ao entrar no mundo
+        if IsInGuild() then
+            if C_GuildInfo and C_GuildInfo.GuildRoster then
+                C_GuildInfo.GuildRoster()
+            elseif GuildRoster then
+                GuildRoster()
+            end
+        end
+        self:UnregisterEvent("PLAYER_ENTERING_WORLD")
     end
 end)
